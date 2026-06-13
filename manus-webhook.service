@@ -1,0 +1,16 @@
+[Unit]
+Description=Manus Webhook Dashboard Updater Service
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/opt/webhook-dashboard-updater
+Environment="MANUS_API_KEY=YOUR_API_KEY_HERE"
+ExecStart=/usr/local/bin/uvicorn main:app --host 0.0.0.0 --port 8089
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/manus-webhook.log
+StandardError=append:/var/log/manus-webhook.log
+
+[Install]
+WantedBy=multi-user.target
