@@ -24,6 +24,24 @@ if not MANUS_API_KEY:
 
 MANUS_API_BASE = "https://api.manus.ai/v2"
 
+# -----------------------------------------------------------------------
+# LOOP PREVENTION: Any task whose title contains one of these strings
+# will be silently ignored — no dashboard update will be spawned.
+# This list must cover ALL titles that this service itself generates,
+# plus any "fix" or "restore" tasks that should never trigger updates.
+# -----------------------------------------------------------------------
+BLOCKED_TITLE_SUBSTRINGS = [
+    "Dashboard Update",
+    "Dashboard Fix",
+    "Dashboard Restore",
+    "Restore KeZ",
+    "Restore DMI",
+    "Restore Calamari",
+    "Restore Carmuvr",
+    "Audit VM",
+    "Extract",
+]
+
 class TaskDetail(BaseModel):
     task_id: str
     task_title: str
@@ -46,6 +64,7 @@ def health_check():
 async def manus_webhook(payload: WebhookPayload):
     logger.info(f"Received webhook event: {payload.event_type} for task: {payload.task_detail.task_id}")
 
+    # GATE 1: Only act on task_stopped with stop_reason=finish
     if payload.event_type != "task_stopped":
         logger.info(f"Ignoring event type: {payload.event_type}")
         return {"status": "ignored", "reason": "Not a task_stopped event"}
@@ -56,24 +75,19 @@ async def manus_webhook(payload: WebhookPayload):
 
     task_title = payload.task_detail.task_title
 
-    # 1. Skip if the task title contains "Dashboard Update" or "Dashboard Fix"
-    if "Dashboard Update" in task_title or "Dashboard Fix" in task_title:
-        logger.info(f"Skipping dashboard update/fix task to avoid infinite loop: {task_title}")
-        return {"status": "ignored", "reason": "Dashboard update or fix task"}
+    # GATE 2: Block any title that contains a blocked substring (loop prevention)
+    for blocked in BLOCKED_TITLE_SUBSTRINGS:
+        if blocked.lower() in task_title.lower():
+            logger.info(f"Blocked title match '{blocked}' — ignoring task: {task_title}")
+            return {"status": "ignored", "reason": f"Blocked title substring: {blocked}"}
 
-    # 2. Skip if the task title contains "Audit VM" or "Extract" (infrastructure tasks)
-    if "Audit VM" in task_title or "Extract" in task_title:
-        logger.info(f"Skipping infrastructure task: {task_title}")
-        return {"status": "ignored", "reason": "Infrastructure task"}
-
+    # GATE 3: Minimum message length — must have real content
     message_content = payload.task_detail.message or ""
-    
-    # 3. Add a minimum message length check
     if len(message_content) < 20:
-        logger.info(f"Skipping task due to short message length ({len(message_content)} chars)")
+        logger.info(f"Skipping task due to short message length ({len(message_content)} chars): {task_title}")
         return {"status": "ignored", "reason": "Message too short"}
 
-    # 4. Parse the task title to determine which project it belongs to
+    # GATE 4: Match to a known project via title keywords
     title_lower = task_title.lower()
     project_name = None
 
@@ -86,24 +100,24 @@ async def manus_webhook(payload: WebhookPayload):
     elif any(keyword in title_lower for keyword in ["dmi", "f2m", "turo"]):
         project_name = "DMI"
     else:
-        logger.info(f"Unknown project for task: {task_title}")
+        logger.info(f"No project match for task: {task_title}")
         return {"status": "ignored", "reason": "Unknown project"}
 
     logger.info(f"Matched project: {project_name} for task: {task_title}")
 
-    # 5. Spawn a Manus task to update the dashboard
-    # Use verbatim task summary (task_detail.message)
-    current_focus = message_content.replace('\n', ' ')
+    # Use VERBATIM task summary — never infer or hallucinate content
+    current_focus = message_content.replace('\n', ' ').strip()
 
-    instruction = f"""
-Update the Google Sheets TV dashboard (Command Center tab) at spreadsheet ID 1kDBFSnfpTUWKW7bQcPTGsiQ7uZQO1KU2lCdgvm3KoVI.
-Use GCP_SERVICE_ACCOUNT_JSON env var to authenticate.
-Update {project_name} row with:
-- Current Focus: {current_focus}
-- Next Action: Review completed task results
-- Waiting On: Steward review
-Update timestamp in row 18 col A.
-"""
+    instruction = (
+        f"Update the Google Sheets TV dashboard (Command Center tab) at spreadsheet ID "
+        f"1kDBFSnfpTUWKW7bQcPTGsiQ7uZQO1KU2lCdgvm3KoVI.\n"
+        f"Use GCP_SERVICE_ACCOUNT_JSON env var to authenticate.\n"
+        f"Update {project_name} row with:\n"
+        f"- Current Focus: {current_focus}\n"
+        f"- Next Action: Review completed task results\n"
+        f"- Waiting On: Steward review\n"
+        f"Update timestamp in row 18 col A."
+    )
 
     headers = {
         "x-manus-api-key": MANUS_API_KEY,
