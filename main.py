@@ -552,11 +552,23 @@ async def manus_webhook(request: Request):
     # No project matching needed — the spawned task reads ALL projects from the API.
     # Credits balance is passed into the prompt so the refresh task can include it.
     logger.info(f"Spawning full dashboard refresh for completed task: {task_title!r}")
-    _spawn_full_dashboard_update(task_title, credits_balance)
+    refresh_result = _spawn_full_dashboard_update(task_title, credits_balance)
 
+    if refresh_result == "cooldown":
+        return {
+            "status": "skipped",
+            "action": "cooldown_active",
+            "credits_balance": credits_balance,
+        }
+    if refresh_result == "triggered":
+        return {
+            "status": "success",
+            "action": "full_dashboard_refresh_spawned",
+            "credits_balance": credits_balance,
+        }
     return {
-        "status": "success",
-        "action": "full_dashboard_refresh_spawned",
+        "status": "error",
+        "action": "dashboard_refresh_failed",
         "credits_balance": credits_balance,
     }
 
