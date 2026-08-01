@@ -24,9 +24,11 @@ Key behaviours
    downstream action; other blocked titles are excluded from dashboard spawning.
 7. Structured logging to /var/log/manus-webhook.log via systemd.
 8. Credits balance: fetches available credits from usage.availableCredits on
-   every task_stopped/finish event and includes the balance in the Steward
-   notification and the dashboard refresh prompt. Also exposes a /credits
-   endpoint for on-demand balance queries.
+   EVERY task_stopped event (both finished and paused) and includes the balance
+   in the Steward notification and the dashboard refresh prompt. The credit
+   balance is formatted as "Credits remaining: X / Y" where X is total_credits
+   and Y is pro_monthly_credits. Also exposes a /credits endpoint for
+   on-demand balance queries.
 """
 import base64
 import fcntl
@@ -231,10 +233,14 @@ def _api_headers() -> Dict[str, str]:
     }
 
 
-def _fetch_credits_balance() -> Optional[float]:
+def _fetch_credits_balance() -> Optional[Dict[str, Any]]:
     """
     Fetch the current available credits balance from the Manus API.
-    Returns the balance as a float, or None if the call fails.
+    Returns a dict with total_credits, pro_monthly_credits, free_credits,
+    periodic_credits, and a formatted 'credits_label' string, or None if
+    the call fails.
+    Response schema: {"free_credits": N, "ok": True, "periodic_credits": N,
+                      "pro_monthly_credits": N, "total_credits": N}
     """
     try:
         resp = requests.get(
@@ -244,11 +250,7 @@ def _fetch_credits_balance() -> Optional[float]:
         )
         resp.raise_for_status()
         data = resp.json()
-        # Actual API response schema (from usage.availableCredits):
-        # {"free_credits": N, "ok": True, "periodic_credits": N,
-        #  "pro_monthly_credits": N, "total_credits": N, "request_id": "..."}
-        # We report total_credits as the primary balance, with a breakdown.
-        balance = (
+        total = (
             data.get("total_credits")
             or data.get("data", {}).get("total_credits")
             or data.get("available_credits")
@@ -256,9 +258,23 @@ def _fetch_credits_balance() -> Optional[float]:
             or data.get("credits")
             or data.get("balance")
         )
-        if balance is not None:
-            logger.info(f"Credits balance fetched: total={balance}")
-            return float(balance)
+        if total is not None:
+            total = int(total)
+            pro_monthly = data.get("pro_monthly_credits") or data.get("data", {}).get("pro_monthly_credits")
+            free = data.get("free_credits") or data.get("data", {}).get("free_credits")
+            periodic = data.get("periodic_credits") or data.get("data", {}).get("periodic_credits")
+            if pro_monthly is not None:
+                credits_label = f"Credits remaining: {total:,} / {int(pro_monthly):,}"
+            else:
+                credits_label = f"Credits remaining: {total:,}"
+            logger.info(f"Credits balance fetched: {credits_label}")
+            return {
+                "total_credits": total,
+                "pro_monthly_credits": int(pro_monthly) if pro_monthly is not None else None,
+                "free_credits": int(free) if free is not None else None,
+                "periodic_credits": int(periodic) if periodic is not None else None,
+                "credits_label": credits_label,
+            }
         # Log the raw response so we can adapt if the schema differs
         logger.warning(f"Credits balance key not found in response: {data}")
         return None
@@ -269,17 +285,17 @@ def _fetch_credits_balance() -> Optional[float]:
 
 def _forward_to_steward(task_id: str, task_title: str, task_url: str,
                          message: str, stop_reason: str,
-                         credits_balance: Optional[float] = None) -> None:
+                         credits_info: Optional[Dict[str, Any]] = None) -> None:
     """Send a compact completion/pause notice to the Steward via task.sendMessage."""
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     status_emoji = "✅" if stop_reason == "finish" else "⏸️"
     status_label = "COMPLETED" if stop_reason == "finish" else "PAUSED (needs input)"
 
     credits_line = ""
-    if credits_balance is not None:
-        credits_line = f"\n**Credits Remaining:** {credits_balance:,.2f}"
-    elif stop_reason == "finish":
-        credits_line = "\n**Credits Remaining:** (unavailable)"
+    if credits_info is not None:
+        credits_line = f"\n**{credits_info['credits_label']}**"
+    else:
+        credits_line = "\n**Credits remaining:** (unavailable)"
 
     content = (
         f"{status_emoji} **Task {status_label}** — {now_utc}\n\n"
@@ -293,6 +309,7 @@ def _forward_to_steward(task_id: str, task_title: str, task_url: str,
         "task_id": STEWARD_TASK_ID,
         "message": {"content": content},
     }
+    logger.info(f"Steward notification content preview: {content[:300]}")
     try:
         resp = requests.post(
             f"{MANUS_API_BASE}/task.sendMessage",
@@ -315,7 +332,7 @@ def _is_dashboard_refresh_task(task_title: str) -> bool:
 
 
 def _spawn_full_dashboard_update(triggering_task_title: str,
-                                  credits_balance: Optional[float] = None) -> str:
+                                  credits_info: Optional[Dict[str, Any]] = None) -> str:
     """
     Spawn a full Manus dashboard-update task — identical to the hourly scheduled run.
     Reads all project go-forward plans from GitHub and rewrites the entire sheet.
@@ -324,15 +341,15 @@ def _spawn_full_dashboard_update(triggering_task_title: str,
     A 600-second cooldown prevents multiple spawns when several tasks finish
     in quick succession.
 
-    If credits_balance is provided, it is appended to the prompt so the refresh
+    If credits_info is provided, it is appended to the prompt so the refresh
     task can include it in the sheet or the Steward can read it.
     """
     # Build the credits context suffix
-    if credits_balance is not None:
+    if credits_info is not None:
         credits_context = (
             f"\n\nCREDITS BALANCE CONTEXT:\n"
             f"At the time this refresh was triggered, the available Manus credits balance "
-            f"was {credits_balance:,.2f}. Please include this figure in the dashboard "
+            f"was {credits_info['credits_label']}. Please include this figure in the dashboard "
             f"(e.g., in a footer row or a dedicated 'Credits Remaining' cell below the "
             f"'Last Updated' timestamp)."
         )
@@ -515,10 +532,14 @@ async def manus_webhook(request: Request):
         logger.info(f"Dashboard/refresh self-exclusion: {task_title!r}")
         return {"status": "ignored", "reason": "Dashboard/refresh self-exclusion"}
 
-    # --- Option A: Fetch credits balance on task_stopped/finish ---
-    credits_balance: Optional[float] = None
-    if stop_reason == "finish":
-        credits_balance = _fetch_credits_balance()
+    # --- Fetch credits balance on ALL task_stopped events ---
+    # Credits are fetched for both finished and paused tasks so every
+    # notification includes the current balance in "Credits remaining: X / Y" format.
+    credits_info: Optional[Dict[str, Any]] = _fetch_credits_balance()
+    if credits_info:
+        logger.info(f"Credits fetched for event: {credits_info['credits_label']}")
+    else:
+        logger.warning("Credits fetch returned None — balance will show as unavailable")
 
     # --- Gate 3: Forward paused tasks only ---
     # Finished-task forwarding previously caused Steward to create separate
@@ -526,14 +547,15 @@ async def manus_webhook(request: Request):
     # Finished tasks are handled exclusively by the locked task.create path below.
     if stop_reason != "finish" and task_id and task_id != "unknown":
         _forward_to_steward(task_id, task_title, task_url, message_content,
-                            stop_reason, credits_balance)
+                            stop_reason, credits_info)
     elif stop_reason == "finish":
         logger.info("Completion forwarding to Steward suppressed; cooldown-controlled refresh owns this event")
 
     # --- Gate 4: Dashboard update only for finish events ---
     if stop_reason != "finish":
         logger.info(f"Skipping dashboard update — stop_reason: {stop_reason!r}")
-        return {"status": "forwarded_to_steward", "reason": "Task paused, not finished"}
+        credits_label = credits_info["credits_label"] if credits_info else "unavailable"
+        return {"status": "forwarded_to_steward", "reason": "Task paused, not finished", "credits_remaining": credits_label}
 
     # --- Gate 4: Explicitly prevent refresh tasks from recursively spawning ---
     # task_detail.task_title is the webhook's actual task identity field.
@@ -552,24 +574,26 @@ async def manus_webhook(request: Request):
     # No project matching needed — the spawned task reads ALL projects from the API.
     # Credits balance is passed into the prompt so the refresh task can include it.
     logger.info(f"Spawning full dashboard refresh for completed task: {task_title!r}")
-    refresh_result = _spawn_full_dashboard_update(task_title, credits_balance)
+    refresh_result = _spawn_full_dashboard_update(task_title, credits_info)
+
+    credits_label = credits_info["credits_label"] if credits_info else "unavailable"
 
     if refresh_result == "cooldown":
         return {
             "status": "skipped",
             "action": "cooldown_active",
-            "credits_balance": credits_balance,
+            "credits_remaining": credits_label,
         }
     if refresh_result == "triggered":
         return {
             "status": "success",
             "action": "full_dashboard_refresh_spawned",
-            "credits_balance": credits_balance,
+            "credits_remaining": credits_label,
         }
     return {
         "status": "error",
         "action": "dashboard_refresh_failed",
-        "credits_balance": credits_balance,
+        "credits_remaining": credits_label,
     }
 
 
