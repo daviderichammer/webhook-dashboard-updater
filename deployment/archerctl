@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+set -a
+. /etc/manus-webhook.env
+set +a
+exec /opt/webhook-dashboard-updater/venv/bin/python /opt/archer-control/archer_control.py "$@"

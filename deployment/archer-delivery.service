@@ -1,0 +1,13 @@
+[Unit]
+Description=Deliver durable Archer feedback to the current idle command lane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/archer-control
+EnvironmentFile=/etc/manus-webhook.env
+Environment=PYTHONPATH=/opt/archer-control
+ExecStart=/opt/webhook-dashboard-updater/venv/bin/python /opt/archer-control/archer_control.py dispatch
+TimeoutStartSec=120
+UMask=0077

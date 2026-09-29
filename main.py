@@ -11,8 +11,8 @@ Key behaviours
    NOTE: The Manus docs example has a double-hashing bug. The correct approach
    is to pass `signed_content` directly to key.verify() with hashes.SHA256(),
    which performs a single SHA256 hash internally (standard RSA-SHA256).
-3. On paused task_stopped events: forwards a compact summary to the Steward
-   agent via task.sendMessage. Finished events stay on the cooldown-controlled path.
+3. On paused task_stopped events: queues a compact summary for the current
+   coordinator. Finished events stay on the cooldown-controlled path.
 4. On task_stopped / stop_reason=finish: spawns a FULL dashboard-update task
    via the Manus API — identical to the hourly scheduled run. The spawned task
    reads all project go-forward plans from GitHub and rewrites the entire sheet
@@ -44,6 +44,7 @@ from typing import Any, Dict, Optional
 
 import requests
 from fastapi import FastAPI, Request, Response
+from archer_control import enqueue_notice, is_coordinator
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -63,9 +64,6 @@ if not MANUS_API_KEY:
     logger.warning("MANUS_API_KEY env variable is not set. API calls will fail.")
 
 MANUS_API_BASE = "https://api.manus.ai/v2"
-
-# Steward agent task_id — used for task.sendMessage forwarding
-STEWARD_TASK_ID = "PfG6WuVPozpFfyNhBDXuGh"
 
 # Google Sheets dashboard project_id (used when spawning the full update task)
 DASHBOARD_PROJECT_ID = "KyouqUkPZoyWqcg9WyCFgF"
@@ -142,6 +140,7 @@ WEBHOOK_EVENT_DB = os.environ.get(
     "MANUS_WEBHOOK_EVENT_DB", "/var/lib/manus-webhook/events.sqlite3"
 )
 WEBHOOK_EVENT_RETENTION_SECONDS = 30 * 24 * 60 * 60
+WEBHOOK_EVENT_LEASE_SECONDS = 300
 
 # ---------------------------------------------------------------------------
 # The full dashboard update instruction — identical to the hourly scheduled run
@@ -323,6 +322,8 @@ def _event_db() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(WEBHOOK_EVENT_DB), mode=0o700, exist_ok=True)
     conn = sqlite3.connect(WEBHOOK_EVENT_DB, timeout=5)
     conn.execute("PRAGMA journal_mode=WAL")
+    # Retain this historical table as evidence. It uses event_id as a primary
+    # key, so it cannot represent provider ID reuse with a changed payload.
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS webhook_events (
@@ -348,67 +349,126 @@ def _event_db() -> sqlite3.Connection:
         except sqlite3.OperationalError as exc:
             if "duplicate column name" not in str(exc).casefold():
                 raise
-        conn.commit()
+    # This old index keyed unrelated task turns to the same lifecycle fields.
+    # Drop only it; all legacy rows remain intact for exact retry detection.
+    conn.execute("DROP INDEX IF EXISTS webhook_task_event_once")
     conn.execute(
         """
-        CREATE UNIQUE INDEX IF NOT EXISTS webhook_task_event_once
-        ON webhook_events(task_id, event_type, stop_reason)
+        CREATE TABLE IF NOT EXISTS webhook_deliveries (
+            delivery_key TEXT PRIMARY KEY,
+            event_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            stop_reason TEXT NOT NULL,
+            body_sha256 TEXT NOT NULL,
+            received_at INTEGER NOT NULL,
+            processed_at INTEGER,
+            status TEXT NOT NULL CHECK(status IN ('processing', 'processed')),
+            disposition TEXT NOT NULL DEFAULT 'recorded'
+        )
         """
     )
+    conn.commit()
     return conn
+
+
+def _delivery_key(event_id: str, body_sha256: str) -> str:
+    """Return the exact delivery identity, including the provider payload hash."""
+    return hashlib.sha256(f"{event_id}\0{body_sha256}".encode("utf-8")).hexdigest()
+
+
+def _lease_is_stale(received_at: Any, now: int) -> bool:
+    """Treat malformed or leases older than five minutes as safely reclaimable."""
+    try:
+        return now - int(received_at) > WEBHOOK_EVENT_LEASE_SECONDS
+    except (TypeError, ValueError):
+        return True
 
 
 def _reserve_event(
     event_id: str, task_id: str, event_type: str, stop_reason: str, body_sha256: str
 ) -> str:
-    """Atomically reserve an event; return reserved, duplicate, or in_progress."""
+    """Atomically reserve an exact delivery; return reserved, duplicate, or in_progress.
+
+    Provider event IDs have been reused with changed payloads. New deliveries
+    use a hash of the raw provider ID and body hash. Exact legacy retries are
+    still recognized without modifying legacy evidence rows.
+    """
     now = int(time.time())
+    delivery_key = _delivery_key(event_id, body_sha256)
     conn = _event_db()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        delivery = conn.execute(
+            "SELECT status, received_at FROM webhook_deliveries WHERE delivery_key = ?",
+            (delivery_key,),
+        ).fetchone()
+        if delivery:
+            if delivery[0] == "processed":
+                conn.commit()
+                return "duplicate"
+            if not _lease_is_stale(delivery[1], now):
+                conn.commit()
+                return "in_progress"
+            conn.execute(
+                "UPDATE webhook_deliveries SET received_at = ?, processed_at = NULL, "
+                "status = 'processing', disposition = 'recorded' WHERE delivery_key = ?",
+                (now, delivery_key),
+            )
+            conn.commit()
+            return "reserved"
+
+        legacy = conn.execute(
+            "SELECT status, received_at FROM webhook_events "
+            "WHERE event_id = ? AND body_sha256 = ?",
+            (event_id, body_sha256),
+        ).fetchone()
+        if legacy:
+            if legacy[0] == "processed":
+                conn.commit()
+                return "duplicate"
+            if not _lease_is_stale(legacy[1], now):
+                conn.commit()
+                return "in_progress"
+
         conn.execute(
             """
-            INSERT INTO webhook_events
-            (event_id, task_id, event_type, stop_reason, body_sha256, received_at, status)
-            VALUES (?, ?, ?, ?, ?, ?, 'processing')
+            INSERT INTO webhook_deliveries
+            (delivery_key, event_id, task_id, event_type, stop_reason, body_sha256, received_at, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'processing')
             """,
-            (event_id, task_id, event_type, stop_reason, body_sha256, now),
+            (delivery_key, event_id, task_id, event_type, stop_reason, body_sha256, now),
         )
         conn.commit()
         return "reserved"
-    except sqlite3.IntegrityError:
+    except Exception:
         conn.rollback()
-        row = conn.execute(
-            "SELECT status FROM webhook_events WHERE event_id = ? OR "
-            "(task_id = ? AND event_type = ? AND stop_reason = ?) "
-            "ORDER BY received_at DESC LIMIT 1",
-            (event_id, task_id, event_type, stop_reason),
-        ).fetchone()
-        return "duplicate" if row and row[0] == "processed" else "in_progress"
+        raise
     finally:
         conn.close()
 
 
-def _complete_event(event_id: str, disposition: str = "recorded") -> None:
+def _complete_event(delivery_key: str, disposition: str = "recorded") -> None:
+    """Mark only the exact delivery key as processed."""
     conn = _event_db()
     try:
         conn.execute(
-            "UPDATE webhook_events SET status = 'processed', processed_at = ?, disposition = ? "
-            "WHERE event_id = ?",
-            (int(time.time()), disposition, event_id),
+            "UPDATE webhook_deliveries SET status = 'processed', processed_at = ?, disposition = ? "
+            "WHERE delivery_key = ?",
+            (int(time.time()), disposition, delivery_key),
         )
         conn.commit()
     finally:
         conn.close()
 
 
-def _release_event(event_id: str) -> None:
-    """Release a failed delivery so Manus may retry it safely."""
+def _release_event(delivery_key: str) -> None:
+    """Release only a failed exact delivery so Manus may retry it safely."""
     conn = _event_db()
     try:
         conn.execute(
-            "DELETE FROM webhook_events WHERE event_id = ? AND status = 'processing'",
-            (event_id,),
+            "DELETE FROM webhook_deliveries WHERE delivery_key = ? AND status = 'processing'",
+            (delivery_key,),
         )
         conn.commit()
     finally:
@@ -467,8 +527,13 @@ def _fetch_credits_balance() -> Optional[Dict[str, Any]]:
 
 def _forward_to_steward(task_id: str, task_title: str, task_url: str,
                          message: str, stop_reason: str,
-                         credits_info: Optional[Dict[str, Any]] = None) -> bool:
-    """Send a compact completion/pause notice to the Steward via task.sendMessage."""
+                         credits_info: Optional[Dict[str, Any]] = None,
+                         notice_id: Optional[str] = None) -> bool:
+    """Durably queue a compact completion/pause notice for the coordinator.
+
+    A True return means the queue accepted the notice (including an idempotent
+    duplicate); it does not mean that a coordinator has received it yet.
+    """
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     status_emoji, status_label = {
         "finish": ("✅", "COMPLETED"),
@@ -490,23 +555,30 @@ def _forward_to_steward(task_id: str, task_title: str, task_url: str,
         f"{credits_line}\n\n"
         f"**Summary:**\n{message[:800]}{'...' if len(message) > 800 else ''}"
     )
-    payload = {
-        "task_id": STEWARD_TASK_ID,
-        "message": {"content": content},
-    }
-    logger.info(f"Steward notification content preview: {content[:300]}")
+    if notice_id is None:
+        notice_id = "manus-webhook:" + hashlib.sha256(
+            f"{task_id}\0{stop_reason}\0{task_title}\0{message}".encode("utf-8")
+        ).hexdigest()
+    logger.info(f"Coordinator notice content preview: {content[:300]}")
     try:
-        resp = requests.post(
-            f"{MANUS_API_BASE}/task.sendMessage",
-            headers=_api_headers(),
-            json=payload,
-            timeout=30,
+        accepted = enqueue_notice(
+            notice_id,
+            content,
+            source_task_id=task_id,
+            kind="task_stopped",
         )
-        resp.raise_for_status()
-        logger.info(f"Forwarded {stop_reason!r} notice to Steward for task: {task_id}")
-        return True
+        if accepted:
+            logger.info(
+                "Coordinator notice queued (not delivered) notice_id=%s task_id=%s stop_reason=%s",
+                notice_id,
+                task_id,
+                stop_reason,
+            )
+            return True
+        logger.error("Coordinator queue declined notice_id=%s task_id=%s", notice_id, task_id)
+        return False
     except Exception as exc:
-        logger.error(f"Failed to forward to Steward: {exc}")
+        logger.error(f"Failed to queue coordinator notice: {exc}")
         return False
 
 
@@ -624,6 +696,20 @@ def _is_routine_turo_completion(
     if any(marker in normalized_message for marker in MATERIAL_TURO_COMPLETION_MESSAGE_MARKERS):
         return False
     return normalized_title.startswith(ROUTINE_TURO_TITLE_PREFIXES)
+
+
+def _is_orphan_routine_turo_completion(
+    is_project_task: bool, task_title: str, stop_reason: str, message_content: str
+) -> bool:
+    """Return True only for a non-project routine Turo completion.
+
+    This narrowly suppresses dashboard-refresh creation for orphan Host Leads
+    verification work while preserving project callbacks and manual refreshes.
+    """
+    return (
+        not is_project_task
+        and _is_routine_turo_completion(task_title, stop_reason, message_content)
+    )
 
 
 def _spawn_full_dashboard_update(triggering_task_title: str,
@@ -822,6 +908,7 @@ async def manus_webhook(request: Request):
             return Response(content="Bad Request", status_code=400)
 
     body_hash = hashlib.sha256(body_bytes).hexdigest()
+    delivery_key = _delivery_key(event_id, body_hash)
     reservation = _reserve_event(event_id, task_id, event_type, stop_reason, body_hash)
     logger.info(
         "Webhook received event_id=%s task_id=%s event_type=%s stop_reason=%s "
@@ -838,8 +925,30 @@ async def manus_webhook(request: Request):
     if reservation == "in_progress":
         return Response(content="Accepted", status_code=202)
 
+    # Never consume active or retired coordinator lifecycle callbacks. A bad
+    # configuration fails closed before any credit, membership, or dashboard
+    # work, while signature verification remains enforced above.
+    try:
+        if is_coordinator(task_id):
+            _complete_event(delivery_key, "suppressed_coordinator_self_callback")
+            logger.info(
+                "Coordinator self callback suppressed event_id=%s task_id=%s",
+                event_id,
+                task_id,
+            )
+            return {"status": "processed", "action": "coordinator_self_callback_suppressed"}
+    except Exception as exc:
+        _release_event(delivery_key)
+        logger.error(
+            "Coordinator configuration unavailable event_id=%s task_id=%s: %s",
+            event_id,
+            task_id,
+            exc,
+        )
+        return Response(content="Service Unavailable", status_code=503)
+
     if event_type == "task_created":
-        _complete_event(event_id)
+        _complete_event(delivery_key)
         logger.info("Webhook recorded task creation event_id=%s task_id=%s", event_id, task_id)
         return {"status": "recorded"}
 
@@ -850,13 +959,18 @@ async def manus_webhook(request: Request):
     # authenticated task-detail response; unresolved lookup failures are retried.
     membership = _fetch_task_membership(task_id)
     if membership is None:
-        _release_event(event_id)
+        _release_event(delivery_key)
         logger.error("Coordinator routing lookup failed event_id=%s task_id=%s", event_id, task_id)
         return Response(content="Service Unavailable", status_code=503)
 
     is_project_task = membership["task_type"] == "project"
     notification_reason = _notification_stop_reason(stop_reason, membership["status"])
     disposition = "suppressed_orphan_task"
+    suppress_orphan_routine_turo_dashboard_refresh = (
+        _is_orphan_routine_turo_completion(
+            is_project_task, task_title, stop_reason, message_content
+        )
+    )
     suppress_orphan_triggered_dashboard_refresh = False
     if is_project_task and _is_dashboard_refresh_task(task_title):
         trigger_membership = _dashboard_refresh_trigger_membership(task_id, task_title)
@@ -864,7 +978,13 @@ async def manus_webhook(request: Request):
             trigger_membership is not None and trigger_membership["task_type"] != "project"
         )
 
-    if not is_project_task:
+    if suppress_orphan_routine_turo_dashboard_refresh:
+        disposition = "suppressed_orphan_turo_dashboard_refresh"
+        logger.info(
+            "Orphan routine Turo completion recorded without coordinator forwarding or dashboard refresh "
+            "event_id=%s task_id=%s task_type=%s", event_id, task_id, membership["task_type"],
+        )
+    elif not is_project_task:
         logger.info(
             "Orphan task event recorded without coordinator forwarding "
             "event_id=%s task_id=%s task_type=%s", event_id, task_id, membership["task_type"],
@@ -879,54 +999,68 @@ async def manus_webhook(request: Request):
         )
     else:
         if not _forward_to_steward(
-            task_id, task_title, task_url, message_content, notification_reason, credits_info
+            task_id,
+            task_title,
+            task_url,
+            message_content,
+            notification_reason,
+            credits_info,
+            notice_id=f"manus-webhook:{delivery_key}",
         ):
-            _release_event(event_id)
+            _release_event(delivery_key)
             logger.error("Coordinator notification failed event_id=%s task_id=%s", event_id, task_id)
             return Response(content="Service Unavailable", status_code=503)
-        disposition = f"coordinator_notified_project_{notification_reason}"
+        disposition = f"coordinator_queued_project_{notification_reason}"
         logger.info(
-            "Project coordinator notification processed event_id=%s task_id=%s task_status=%s",
+            "Project coordinator notice queued event_id=%s task_id=%s task_status=%s",
             event_id, task_id, membership["status"],
         )
 
     if stop_reason != "finish":
-        _complete_event(event_id, disposition)
+        _complete_event(delivery_key, disposition)
         return {
             "status": "processed",
             "action": (
                 "orphan_triggered_dashboard_refresh_recorded"
                 if suppress_orphan_triggered_dashboard_refresh
-                else "coordinator_notified" if is_project_task else "orphan_task_recorded"
+                else "coordinator_queued" if is_project_task else "orphan_task_recorded"
             ),
         }
 
+    if suppress_orphan_routine_turo_dashboard_refresh:
+        _complete_event(delivery_key, disposition)
+        logger.info(
+            "Dashboard refresh suppressed for orphan routine Turo completion event_id=%s",
+            event_id,
+        )
+        return {"status": "processed", "action": "orphan_turo_dashboard_refresh_suppressed"}
+
     # Preserve the existing dashboard loop-prevention and cooldown behavior.
     if _is_dashboard_refresh_task(task_title):
-        _complete_event(event_id, disposition)
+        _complete_event(delivery_key, disposition)
         logger.info("Dashboard self-refresh not re-triggered event_id=%s", event_id)
         action = (
             "orphan_triggered_dashboard_refresh_recorded"
             if suppress_orphan_triggered_dashboard_refresh
-            else "coordinator_notified" if is_project_task else "orphan_task_recorded"
+            else "coordinator_queued" if is_project_task else "orphan_task_recorded"
         )
         return {"status": "processed", "action": action}
 
     title_lower = task_title.lower()
     for word in BLOCKED_TITLE_WORDS:
         if word in title_lower:
-            _complete_event(event_id, disposition)
+            _complete_event(delivery_key, disposition)
             logger.info("Dashboard update skipped for blocked-title event_id=%s", event_id)
             action = (
             "orphan_triggered_dashboard_refresh_recorded"
             if suppress_orphan_triggered_dashboard_refresh
-            else "coordinator_notified" if is_project_task else "orphan_task_recorded"
+            else "coordinator_queued" if is_project_task else "orphan_task_recorded"
         )
             return {"status": "processed", "action": action}
 
     logger.info("Spawning dashboard refresh after completion event_id=%s", event_id)
     refresh_result = _spawn_full_dashboard_update(task_title, credits_info)
-    _complete_event(event_id, disposition)
+    _complete_event(delivery_key, disposition)
     if refresh_result == "cooldown":
         return {"status": "processed", "action": "cooldown_active"}
     if refresh_result == "triggered":
