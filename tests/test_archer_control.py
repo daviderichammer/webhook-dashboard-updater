@@ -51,6 +51,17 @@ def test_queue_is_idempotent_and_survives_swap(registry,monkeypatch):
     assert ac.status()['pending_notices']==0
     assert ac.status()['last_api_acceptance']['delivered_to']==NEW
 
+def test_backlog_is_cleared_without_api_call(registry,monkeypatch):
+    ac.enqueue_notice('first','First observation')
+    ac.enqueue_notice('second','Second observation')
+    c=ac._db()
+    with c:
+        c.execute('UPDATE notices SET next_attempt_at=?',(9999999999,))
+    c.close()
+    monkeypatch.setattr(ac,'_request',lambda *a,**k:pytest.fail('No API while clearing backlog'))
+    assert ac.dispatch_once()=={'status':'backlog_cleared','cleared_notices':2}
+    assert ac.status()['pending_notices']==0
+
 def test_empty_queue_never_polls_or_prompts(registry,monkeypatch):
     monkeypatch.setattr(ac,'_request',lambda *a,**k:pytest.fail('No API on empty queue'))
     assert ac.dispatch_once()['status']=='empty'
@@ -68,6 +79,20 @@ def test_pause_keeps_pending(registry,monkeypatch):
     monkeypatch.setattr(ac,'_request',lambda *a,**k:pytest.fail('No API while paused'))
     assert ac.dispatch_once()['status']=='delivery_paused'
     assert ac.status()['pending_notices']==1
+
+def test_paused_backlog_is_cleared_without_api_call(registry,monkeypatch):
+    ac.enqueue_notice('first','First observation')
+    ac.enqueue_notice('second','Second observation')
+    ac.pause_delivery(True)
+    monkeypatch.setattr(ac,'_request',lambda *a,**k:pytest.fail('No API while paused'))
+    assert ac.dispatch_once()=={'status':'backlog_cleared','cleared_notices':2}
+    assert ac.status()['pending_notices']==0
+
+def test_operator_can_clear_pending_notices(registry,monkeypatch):
+    ac.enqueue_notice('first','First observation')
+    monkeypatch.setattr(ac,'_request',lambda *a,**k:pytest.fail('Operator clear must not call API'))
+    assert ac.clear_pending()=={'status':'pending_cleared','cleared_notices':1}
+    assert ac.status()['pending_notices']==0
 
 def test_api_failure_keeps_queue_with_backoff(registry,monkeypatch):
     ac.enqueue_notice('n','observation')

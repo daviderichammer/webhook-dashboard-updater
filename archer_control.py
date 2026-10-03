@@ -121,8 +121,35 @@ def _idle_state(task_id):
             return status if status in {'running','stopped','waiting','error'} else 'unknown'
     return 'unknown'
 
+def _delete_pending(c, *, require_backlog: bool) -> int:
+    """Atomically clear pending notices, optionally only when more than one exists."""
+    c.execute('BEGIN IMMEDIATE')
+    try:
+        pending=c.execute('SELECT count(*) n FROM notices WHERE delivered_at IS NULL').fetchone()['n']
+        if require_backlog and pending<=1:
+            c.rollback()
+            return 0
+        cleared=c.execute('DELETE FROM notices WHERE delivered_at IS NULL').rowcount
+        if cleared!=pending:
+            raise ControlError('Pending queue changed during clear')
+        c.commit()
+        return cleared
+    except BaseException:
+        c.rollback()
+        raise
+
+def clear_pending() -> dict:
+    """Operator control: immediately clear every pending notice without an API call."""
+    with _lock(STATE/'dispatch.lock',exclusive=True):
+        c=_db()
+        try:
+            cleared=_delete_pending(c,require_backlog=False)
+            return {'status':'pending_cleared','cleared_notices':cleared}
+        finally:
+            c.close()
+
 def dispatch_once() -> dict:
-    """Drain one bounded batch only into an idle lane; never answer action gates."""
+    """Deliver one notice only into an idle lane; never answer action gates."""
     try:
         with _lock(STATE/'dispatch.lock',exclusive=True,nonblocking=True):
             return _dispatch_locked()
@@ -132,11 +159,14 @@ def dispatch_once() -> dict:
 def _dispatch_locked():
     with _lock(CONFIG.with_suffix('.lock'),exclusive=False):
         config=load_config()
-        if config['delivery_paused']: return {'status':'delivery_paused'}
-        target=config['active_task_id']
         c=_db()
         try:
-            rows=c.execute('SELECT * FROM notices WHERE delivered_at IS NULL AND next_attempt_at<=? ORDER BY created_at,notice_id LIMIT 4',
+            cleared=_delete_pending(c,require_backlog=True)
+            if cleared:
+                return {'status':'backlog_cleared','cleared_notices':cleared}
+            if config['delivery_paused']: return {'status':'delivery_paused'}
+            target=config['active_task_id']
+            rows=c.execute('SELECT * FROM notices WHERE delivered_at IS NULL AND next_attempt_at<=? ORDER BY created_at,notice_id LIMIT 1',
                            (int(time.time()),)).fetchall()
             if not rows: return {'status':'empty'}
             try:
@@ -206,13 +236,14 @@ def status():
 def main():
     p=argparse.ArgumentParser(description='Archer coordinator registry and delivery queue')
     sub=p.add_subparsers(dest='command',required=True)
-    for name in ['status','dispatch','pause','resume']:sub.add_parser(name)
+    for name in ['status','dispatch','pause','resume','clear-pending']:sub.add_parser(name)
     s=sub.add_parser('switch');s.add_argument('task_id');s.add_argument('--expect',required=True);s.add_argument('--reason',required=True)
     a=p.parse_args()
     try:
         if a.command=='switch': result=switch_task(a.task_id,a.expect,a.reason)
         elif a.command=='status':result=status()
         elif a.command=='dispatch':result=dispatch_once()
+        elif a.command=='clear-pending':result=clear_pending()
         else: result=pause_delivery(a.command=='pause')
         print(json.dumps(result,sort_keys=True));return 0
     except ControlError as exc:
