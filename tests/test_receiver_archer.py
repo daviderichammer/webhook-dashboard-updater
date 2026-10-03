@@ -61,10 +61,8 @@ class ReceiverArcherTests(unittest.TestCase):
         self.addCleanup(self.tempdir.cleanup)
         root = Path(self.tempdir.name)
         self.event_db = root / "events.sqlite3"
-        self.cooldown = root / "cooldown"
         self.patchers = [
             patch.object(receiver, "WEBHOOK_EVENT_DB", str(self.event_db)),
-            patch.object(receiver, "DASHBOARD_COOLDOWN_FILE", str(self.cooldown)),
             patch.object(receiver, "_verify_signature", return_value=True),
             # Tests fail closed if a handler accidentally escapes its mocked
             # branch and tries any production network request.
@@ -244,11 +242,21 @@ class ReceiverArcherTests(unittest.TestCase):
             patch.object(receiver, "enqueue_notice", side_effect=record_enqueue),
             patch.object(receiver, "_fetch_credits_balance", return_value={"credits_label": "Credits remaining: 3 / 10"}),
             patch.object(receiver, "_fetch_task_membership", return_value={"task_type": "project", "status": "stopped"}),
-            patch.object(receiver, "_spawn_full_dashboard_update", return_value="cooldown") as dashboard,
+            patch.object(
+                receiver,
+                "_spawn_full_dashboard_update",
+                return_value={
+                    "status": "dashboard_refresh_cooldown_suppressed",
+                    "prior_dispatch_timestamp": 1000.0,
+                    "remaining_cooldown_seconds": 1,
+                    "cooldown_seconds": 600,
+                },
+            ) as dashboard,
         ):
             result, body = self.invoke(payload)
         key = receiver._delivery_key(payload["event_id"], hashlib.sha256(body).hexdigest())
-        self.assertEqual(result["action"], "cooldown_active")
+        self.assertEqual(result["action"], "dashboard_refresh_cooldown_suppressed")
+        self.assertEqual(result["dashboard_refresh"]["remaining_cooldown_seconds"], 1)
         self.assertEqual(len(enqueued), 1)
         notice_id, content, source_task_id, kind = enqueued[0]
         self.assertEqual(notice_id, f"manus-webhook:{key}")

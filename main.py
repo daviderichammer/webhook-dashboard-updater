@@ -31,10 +31,10 @@ Key behaviours
    on-demand balance queries.
 """
 import base64
-import fcntl
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -130,9 +130,10 @@ BLOCKED_TITLE_WORDS = [
     "steward",
 ]
 
-# Cooldown: only one dashboard update task per 600 seconds (10 minutes)
+# Cooldown: only one dashboard update task per 600 seconds (10 minutes).
+# State is stored in WEBHOOK_EVENT_DB, not /tmp, so it survives receiver restarts.
 DASHBOARD_COOLDOWN_SECONDS = 600
-DASHBOARD_COOLDOWN_FILE = "/tmp/last_dashboard_refresh"
+DASHBOARD_COOLDOWN_KEY = "dashboard_refresh"
 
 # Delivery evidence and idempotency state. This holds only non-secret metadata
 # and a SHA-256 digest of the received body; it never stores webhook contents.
@@ -365,6 +366,16 @@ def _event_db() -> sqlite3.Connection:
             processed_at INTEGER,
             status TEXT NOT NULL CHECK(status IN ('processing', 'processed')),
             disposition TEXT NOT NULL DEFAULT 'recorded'
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dashboard_refresh_cooldown (
+            cooldown_key TEXT PRIMARY KEY,
+            last_dispatch_at REAL NOT NULL,
+            last_result TEXT NOT NULL,
+            last_task_id TEXT
         )
         """
     )
@@ -712,20 +723,142 @@ def _is_orphan_routine_turo_completion(
     )
 
 
-def _spawn_full_dashboard_update(triggering_task_title: str,
-                                  credits_info: Optional[Dict[str, Any]] = None) -> str:
-    """
-    Spawn a full Manus dashboard-update task — identical to the hourly scheduled run.
-    Reads all project go-forward plans from GitHub and rewrites the entire sheet.
-    Does NOT write to the sheet directly from this handler.
+def _dashboard_cooldown_remaining(prior_dispatch_at: float, now: float) -> int:
+    """Return a conservative whole-second cooldown remainder for durable evidence."""
+    return max(1, int(math.ceil(DASHBOARD_COOLDOWN_SECONDS - (now - prior_dispatch_at))))
 
-    A 600-second cooldown prevents multiple spawns when several tasks finish
-    in quick succession.
 
-    If credits_info is provided, it is appended to the prompt so the refresh
-    task can include it in the sheet or the Steward can read it.
+def _reserve_dashboard_refresh(now: Optional[float] = None) -> Dict[str, Any]:
+    """Atomically reserve the only dashboard refresh dispatch in the 600-second window.
+
+    The durable SQLite transaction is committed *before* task.create. This means
+    concurrent callbacks observe the reservation and suppress themselves rather
+    than creating a refresh race; a failed or ambiguous task.create is still not
+    retried by later callbacks in that rolling window.
     """
-    # Build the credits context suffix
+    dispatch_at = time.time() if now is None else float(now)
+    conn = _event_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT last_dispatch_at FROM dashboard_refresh_cooldown WHERE cooldown_key = ?",
+            (DASHBOARD_COOLDOWN_KEY,),
+        ).fetchone()
+        prior_dispatch_at = float(row[0]) if row else None
+        if (
+            prior_dispatch_at is not None
+            and dispatch_at - prior_dispatch_at < DASHBOARD_COOLDOWN_SECONDS
+        ):
+            evidence = {
+                "status": "dashboard_refresh_cooldown_suppressed",
+                "prior_dispatch_timestamp": prior_dispatch_at,
+                "remaining_cooldown_seconds": _dashboard_cooldown_remaining(
+                    prior_dispatch_at, dispatch_at
+                ),
+                "cooldown_seconds": DASHBOARD_COOLDOWN_SECONDS,
+            }
+            conn.commit()
+            return evidence
+        conn.execute(
+            """
+            INSERT INTO dashboard_refresh_cooldown
+                (cooldown_key, last_dispatch_at, last_result, last_task_id)
+            VALUES (?, ?, 'reserved', NULL)
+            ON CONFLICT(cooldown_key) DO UPDATE SET
+                last_dispatch_at = excluded.last_dispatch_at,
+                last_result = 'reserved',
+                last_task_id = NULL
+            """,
+            (DASHBOARD_COOLDOWN_KEY, dispatch_at),
+        )
+        conn.commit()
+        return {
+            "status": "dashboard_refresh_reserved",
+            "dispatch_timestamp": dispatch_at,
+            "prior_dispatch_timestamp": prior_dispatch_at,
+            "remaining_cooldown_seconds": 0,
+            "cooldown_seconds": DASHBOARD_COOLDOWN_SECONDS,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _record_dashboard_refresh_result(
+    dispatch_timestamp: float, result: str, task_id: Optional[str] = None
+) -> None:
+    """Persist a non-secret final outcome for the previously committed reservation."""
+    conn = _event_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            UPDATE dashboard_refresh_cooldown
+            SET last_result = ?, last_task_id = ?
+            WHERE cooldown_key = ? AND last_dispatch_at = ?
+            """,
+            (result, task_id, DASHBOARD_COOLDOWN_KEY, dispatch_timestamp),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def dashboard_refresh_cooldown_status(now: Optional[float] = None) -> Dict[str, Any]:
+    """Return durable, non-secret cooldown evidence without dispatching a task."""
+    observed_at = time.time() if now is None else float(now)
+    conn = _event_db()
+    try:
+        row = conn.execute(
+            """
+            SELECT last_dispatch_at, last_result
+            FROM dashboard_refresh_cooldown
+            WHERE cooldown_key = ?
+            """,
+            (DASHBOARD_COOLDOWN_KEY,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return {
+            "status": "dashboard_refresh_cooldown_ready",
+            "prior_dispatch_timestamp": None,
+            "remaining_cooldown_seconds": 0,
+            "cooldown_seconds": DASHBOARD_COOLDOWN_SECONDS,
+        }
+    prior_dispatch_at = float(row[0])
+    remaining = DASHBOARD_COOLDOWN_SECONDS - (observed_at - prior_dispatch_at)
+    return {
+        "status": (
+            "dashboard_refresh_cooldown_active"
+            if remaining > 0
+            else "dashboard_refresh_cooldown_ready"
+        ),
+        "prior_dispatch_timestamp": prior_dispatch_at,
+        "remaining_cooldown_seconds": max(0, int(math.ceil(remaining))),
+        "cooldown_seconds": DASHBOARD_COOLDOWN_SECONDS,
+        "last_dispatch_result": row[1],
+    }
+
+
+def _spawn_full_dashboard_update(
+    triggering_task_title: str, credits_info: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Spawn one full dashboard update after atomically reserving the durable window."""
+    try:
+        reservation = _reserve_dashboard_refresh()
+    except sqlite3.Error as exc:
+        logger.error("Dashboard refresh cooldown state unavailable error_type=%s", type(exc).__name__)
+        return {"status": "dashboard_refresh_cooldown_state_unavailable"}
+    if reservation["status"] == "dashboard_refresh_cooldown_suppressed":
+        logger.info("Dashboard refresh cooldown evidence=%s", json.dumps(reservation, sort_keys=True))
+        return reservation
+
     if credits_info is not None:
         credits_context = (
             f"\n\nCREDITS BALANCE CONTEXT:\n"
@@ -746,57 +879,42 @@ def _spawn_full_dashboard_update(triggering_task_title: str,
             "connectors": [GCP_CONNECTOR_ID],
         },
     }
-
-    # The timestamp file also serves as the inter-process lock. Holding LOCK_EX
-    # across the check and task.create call prevents concurrent webhook requests
-    # from racing. The timestamp is committed only after a successful API call.
-    with open(DASHBOARD_COOLDOWN_FILE, "a+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        lock_file.seek(0)
-        raw_timestamp = lock_file.read().strip()
+    dispatch_timestamp = reservation["dispatch_timestamp"]
+    try:
+        resp = requests.post(
+            f"{MANUS_API_BASE}/task.create",
+            headers=_api_headers(),
+            json=payload,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        if result.get("ok") is False:
+            raise RuntimeError("Manus task.create returned ok=false")
+        spawned_id = result.get("data", {}).get("task_id") or result.get("task_id", "unknown")
+        _record_dashboard_refresh_result(dispatch_timestamp, "triggered", str(spawned_id))
+        evidence = {
+            "status": "dashboard_refresh_triggered",
+            "dispatch_timestamp": dispatch_timestamp,
+            "dashboard_task_id": str(spawned_id),
+            "cooldown_seconds": DASHBOARD_COOLDOWN_SECONDS,
+        }
+        logger.info("Dashboard refresh dispatch evidence=%s", json.dumps(evidence, sort_keys=True))
+        return evidence
+    except Exception as exc:
         try:
-            last_refresh_time = float(raw_timestamp) if raw_timestamp else 0.0
-        except ValueError:
-            logger.warning("Invalid dashboard cooldown timestamp; treating it as expired.")
-            last_refresh_time = 0.0
-
-        now = time.time()
-        elapsed = now - last_refresh_time
-        if 0 <= elapsed < DASHBOARD_COOLDOWN_SECONDS:
-            remaining = max(1, int(DASHBOARD_COOLDOWN_SECONDS - elapsed + 0.999))
-            logger.info(
-                f"Dashboard refresh skipped: cooldown active ({remaining}s remaining) "
-                f"for {triggering_task_title!r}"
+            _record_dashboard_refresh_result(dispatch_timestamp, "failed")
+        except sqlite3.Error as state_exc:
+            logger.error(
+                "Dashboard refresh cooldown result persistence failed error_type=%s",
+                type(state_exc).__name__,
             )
-            return "cooldown"
-
-        try:
-            resp = requests.post(
-                f"{MANUS_API_BASE}/task.create",
-                headers=_api_headers(),
-                json=payload,
-                timeout=30,
-            )
-            resp.raise_for_status()
-            result = resp.json()
-            if result.get("ok") is False:
-                raise RuntimeError("Manus task.create returned ok=false")
-
-            spawned_id = result.get("data", {}).get("task_id") or result.get("task_id", "unknown")
-            success_time = time.time()
-            lock_file.seek(0)
-            lock_file.truncate()
-            lock_file.write(f"{success_time:.6f}\n")
-            lock_file.flush()
-            os.fsync(lock_file.fileno())
-            logger.info(
-                f"Dashboard refresh triggered successfully: {spawned_id} "
-                f"(triggered by: {triggering_task_title!r})"
-            )
-            return "triggered"
-        except Exception as exc:
-            logger.error(f"Dashboard refresh API failure: {exc}")
-            return "failed"
+        logger.error("Dashboard refresh API failure error_type=%s", type(exc).__name__)
+        return {
+            "status": "dashboard_refresh_failed",
+            "dispatch_timestamp": dispatch_timestamp,
+            "cooldown_seconds": DASHBOARD_COOLDOWN_SECONDS,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -1060,11 +1178,18 @@ async def manus_webhook(request: Request):
 
     logger.info("Spawning dashboard refresh after completion event_id=%s", event_id)
     refresh_result = _spawn_full_dashboard_update(task_title, credits_info)
-    _complete_event(delivery_key, disposition)
-    if refresh_result == "cooldown":
-        return {"status": "processed", "action": "cooldown_active"}
-    if refresh_result == "triggered":
+    refresh_status = refresh_result["status"]
+    if refresh_status == "dashboard_refresh_cooldown_suppressed":
+        _complete_event(delivery_key, "dashboard_refresh_cooldown_suppressed")
+        return {
+            "status": "processed",
+            "action": "dashboard_refresh_cooldown_suppressed",
+            "dashboard_refresh": refresh_result,
+        }
+    if refresh_status == "dashboard_refresh_triggered":
+        _complete_event(delivery_key, "dashboard_refresh_triggered")
         return {"status": "processed", "action": "dashboard_refresh_spawned"}
+    _complete_event(delivery_key, "dashboard_refresh_failed")
     return {"status": "processed", "action": "dashboard_refresh_failed"}
 
 
